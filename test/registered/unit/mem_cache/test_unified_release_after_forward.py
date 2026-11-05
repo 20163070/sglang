@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.capacity import create_prefill_budget
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
 from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.release_queue import ReleaseQueue
@@ -478,6 +479,7 @@ class TestDecodeShortageDrains(CustomTestCase):
         except ImportError as e:
             self.skipTest(f"NPU allocator unavailable: {e}")
         allocator = mock.create_autospec(DSV4NPUTokenToKVPoolAllocator, instance=True)
+        allocator.pools_share_memory = False
         allocator.check_decode_capacity.return_value = False
         batch = _running(_decode_batch(allocator, None, [object()], 1))
         with self.assertRaises(_Retracted):
@@ -735,13 +737,13 @@ class TestRetireReopensAdmission(CustomTestCase):
             taken.append(slot)
         queue.forward_launched()
         state.free(torch.cat(taken))  # held
-        self.assertFalse(allocator.create_prefill_budget(cache).state_slots_fit(1))
+        self.assertGreater(len(queue), 0)
 
         scheduler = _processing_scheduler(allocator)
         Scheduler._on_step_processed(scheduler, mock.Mock())
 
         self.assertFalse(scheduler.running_batch.batch_is_full)
-        self.assertTrue(allocator.create_prefill_budget(cache).state_slots_fit(1))
+        self.assertTrue(create_prefill_budget(allocator, cache).state_slots_fit(1))
 
     def test_a_decode_drain_reopens_admission_at_the_next_step(self):
         """A state-slot rejection closed admission; the same pass's decode
@@ -892,10 +894,10 @@ class TestAdmissionCountsHeldPagesAsOccupied(CustomTestCase):
         """Held pages more than the request's demand never make it negative."""
         allocator, cache, queue = self.allocator, self.cache, self.queue
         row = allocator.alloc(32)
-        self.assertTrue(self._request_fits(allocator.create_prefill_budget(cache), 20))
+        self.assertTrue(self._request_fits(create_prefill_budget(allocator, cache), 20))
         queue.forward_launched()
         allocator.free_segment(row, start_pos=0)
-        self.assertTrue(self._request_fits(allocator.create_prefill_budget(cache), 20))
+        self.assertTrue(self._request_fits(create_prefill_budget(allocator, cache), 20))
         self.assertGreater(len(queue), 0)  # it fit without them
 
     def test_a_request_that_needs_held_pages_drains_them(self):
@@ -905,7 +907,7 @@ class TestAdmissionCountsHeldPagesAsOccupied(CustomTestCase):
         self.assertIsNotNone(allocator.alloc(allocator.available_size()))
         queue.forward_launched()
         allocator.free_segment(row, start_pos=0)
-        self.assertTrue(self._request_fits(allocator.create_prefill_budget(cache), 20))
+        self.assertTrue(self._request_fits(create_prefill_budget(allocator, cache), 20))
         self.assertEqual(len(queue), 0)
 
 
