@@ -48,7 +48,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.tree_slots import tree_slots_of
+from sglang.test.tree_slots import storage_tree_slots
 from sglang.test.unified_allocator_fixtures import (
     UnifiedGeometry,
     arena_of,
@@ -547,8 +547,10 @@ def _own_table_cache(*, window):
             token_to_kv_pool_allocator=allocator,
             page_size=1,
             sliding_window_size=window,
-            tree_slots=tree_slots_of(
-                (ComponentType.FULL, ComponentType.SWA), window=window
+            tree_slots=storage_tree_slots(
+                allocator.storage,
+                window=window,
+                components=(ComponentType.FULL, ComponentType.SWA),
             ),
         )
     )
@@ -780,13 +782,13 @@ class TestEarlyWindowReleaseWaitsForTheForward(CustomTestCase):
 
         queue.forward_launched()  # decode W
         cache.release_swa(lock)  # preparing W + 1
-        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=1000))
+        cache.evict(EvictParams(window_num_tokens={window.sub_pool_name: 1000}))
         # Still bound to the same storage: not freed, so not handed out or
         # zeroed.
         self.assertTrue(bool((window.ids.virtual_to_physical[pages] == physical).all()))
 
         queue.forward_retired()
-        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=1000))
+        cache.evict(EvictParams(window_num_tokens={window.sub_pool_name: 1000}))
         self.assertTrue(bool((window.ids.virtual_to_physical[pages] < 0).all()))
         cache.unlock(lock)
 
@@ -836,7 +838,10 @@ class TestHeldAccountingIsExact(CustomTestCase):
 
         self.assertEqual(queue.held_tokens(owner), 16)
         checker = SimpleNamespace(
-            tree_cache=cache, page_size=4, _requests_owning_rows=lambda: []
+            tree_cache=cache,
+            token_to_kv_pool_allocator=allocator,
+            page_size=4,
+            _requests_owning_rows=lambda: [],
         )
         full, _ = SchedulerInvariantChecker._get_total_uncached_sizes(
             checker, has_window=True
@@ -860,7 +865,6 @@ class TestAdmissionCountsHeldPagesAsOccupied(CustomTestCase):
             total_tokens=total_tokens,
             max_new_tokens=8,
             input_tokens=8,
-            swa_host_hit_length=0,
             chunk_limit=None,
         )[0]
 
