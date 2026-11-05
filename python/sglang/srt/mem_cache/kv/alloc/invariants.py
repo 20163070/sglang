@@ -12,3 +12,8 @@ WINDOW_SEGMENT_BOUND = Invariant(
 WINDOW_SEGMENT_RELEASED = Invariant(
     "chain.window_segment_released", Bucket.FATAL_UNCONTAINABLE, IsTrue()
 )
+# A request's pages come back only once no unprocessed forward includes the
+# request, so a free never names a page an unretired forward writes.
+FREE_AFTER_FORWARD = Invariant(
+    "band.free_after_forward", Bucket.FATAL_UNCONTAINABLE, IsTrue()
+)

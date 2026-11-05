@@ -303,7 +303,7 @@ class SchedulerInvariantChecker:
             if req.beam_group is not None:
                 full_uncached += req.beam_group.extra_uncached_tokens()
 
-        # Pages of ended requests held until the forward in flight is processed.
+        # Pages the pool holds until the forwards in flight are processed.
         allocator = self.token_to_kv_pool_allocator
         queue = release_queue_of(allocator)
         if queue is not None:

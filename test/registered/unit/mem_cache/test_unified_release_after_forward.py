@@ -79,9 +79,8 @@ class TestFreesWaitForTheForwardsInFlight(CustomTestCase):
         self.queue = self.allocator.release_queue
         self.owner = self.allocator.full_attn_allocator
 
-    def test_only_a_lazy_chain_holds(self):
+    def test_the_chain_holds_frees(self):
         self.assertIsInstance(self.queue, ReleaseQueue)
-        self.assertIsNone(build_swa_pool(page_size=4, lazy=False).release_queue)
 
     def test_a_held_row_is_not_handed_out_before_its_forward_is_processed(self):
         allocator, owner, queue = self.allocator, self.owner, self.queue
