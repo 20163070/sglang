@@ -865,10 +865,11 @@ class TestHeldAccountingIsExact(CustomTestCase):
             page_size=4,
             _requests_owning_rows=lambda: [],
         )
-        full, _ = SchedulerInvariantChecker._get_total_uncached_sizes(
-            checker, has_window=True
+        full, windows = SchedulerInvariantChecker._get_total_uncached_sizes(
+            checker, windows=(window,)
         )
         self.assertEqual(full, 16)
+        self.assertEqual(windows, {window: 0})  # the window rows were rehomed
         queue.forward_retired()
         self.assertEqual(queue.held_tokens(owner), 0)
         self.assertEqual(owner.available_size(), owner_before + 16)
