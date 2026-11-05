@@ -42,8 +42,7 @@ from sglang.srt.mem_cache.kv.alloc.release_queue import ReleaseQueue
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.static_kv_storage import acquire_rows, kv_storage_of
-from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
@@ -53,9 +52,8 @@ from sglang.test.unified_allocator_fixtures import (
     UnifiedGeometry,
     arena_of,
     build_mamba_cache,
-    build_swa_cache,
     build_swa_pool,
-    build_tri_pool,
+    build_test_unified_pools,
     build_unified_bundle,
     setup_allocator_context,
 )
@@ -155,16 +153,60 @@ class TestFreesWaitForTheForwardsInFlight(CustomTestCase):
         self.assertEqual(allocator.available_size(), free_before + 8)
 
 
-def _swa_cache(**kwargs):
-    kwargs.setdefault("occupancy", 4)
-    allocator, cache = build_swa_cache(lazy=True, **kwargs)
+def _swa_cache(*, sessions=False, page_size=1, occupancy=4, window=128, max_num_reqs=4):
+    """A full + window unified pool and its prefix tree over the pool's own
+    request table, as the scheduler builds them, with ``occupancy`` cached
+    single-page entries."""
+    allocator = build_test_unified_pools(
+        device="cpu",
+        kv_cache_dtype=torch.float16,
+        head_num=1,
+        head_dim=8,
+        v_head_dim=8,
+        swa_head_num=1,
+        swa_head_dim=8,
+        swa_v_head_dim=8,
+        page_size=page_size,
+        start_layer=0,
+        end_layer=2,
+        swa_attention_layer_ids=[1],
+        full_attention_layer_ids=[0],
+        full_max_total_num_tokens=100 * page_size,
+        swa_max_total_num_tokens=100 * page_size,
+        enable_memory_saver=False,
+        need_sort=False,
+        lazy_compaction=True,
+        total_bytes=100 * page_size * 2 * 32,
+        model_context_len=40 * page_size,
+        max_num_reqs=max_num_reqs,
+    ).token_to_kv_pool_allocator
+    storage = allocator.storage
+    cache = UnifiedRadixCache(
+        CacheInitParams(
+            disable=False,
+            enable_session_radix_cache=sessions,
+            req_to_token_pool=storage.requests,
+            token_to_kv_pool_allocator=allocator,
+            page_size=page_size,
+            sliding_window_size=window,
+            tree_slots=storage_tree_slots(storage, window=window),
+        )
+    )
+    for i in range(occupancy):
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", range(i * 1000, i * 1000 + page_size))),
+                value=allocator.alloc(page_size),
+            )
+        )
+    return allocator, cache, allocator.release_queue
     return allocator, cache, allocator.release_queue
 
 
-def _request(cache, tokens, *, committed, allocated, session=None, pool=None):
+def _request(cache, tokens, *, committed, allocated, session=None):
     """A request whose row holds ``allocated`` token slots, ``committed`` of
     them computed (the rest over-allocated, as speculative decoding leaves)."""
-    pool = cache.req_to_token_pool if pool is None else pool
+    pool = cache.req_to_token_pool
     req = Req(
         rid="r",
         origin_input_text="",
@@ -172,7 +214,7 @@ def _request(cache, tokens, *, committed, allocated, session=None, pool=None):
         sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         session=session,
     )
-    acquire_rows(pool, getattr(pool, "state", None), [req])
+    assert cache.token_to_kv_pool_allocator.storage.acquire([req]) is not None
     req.output_ids = array("q", tokens[committed - 1 : committed])
     req.full_untruncated_fill_ids = array("q", tokens[:committed])
     req.extend_end = committed
@@ -518,7 +560,7 @@ def _request_on_prefix(cache, prefix, *, own):
         origin_input_ids=array("q", prefix),
         sampling_params=SamplingParams(temperature=0, max_new_tokens=64),
     )
-    acquire_rows(pool, pool.state, [req])
+    assert cache.token_to_kv_pool_allocator.storage.acquire([req]) is not None
     slots = cache.token_to_kv_pool_allocator.alloc(own)
     pool.write(
         (req.kv.req_pool_idx, slice(0, len(prefix) + own)),
@@ -535,27 +577,6 @@ def _request_on_prefix(cache, prefix, *, own):
     return req
 
 
-def _own_table_cache(*, window):
-    """A full + window cache over the pool's own request table, which the
-    pool's row releases and window retirement read."""
-    bundle, allocator = build_tri_pool(page_size=1)
-    cache = UnifiedRadixCache(
-        CacheInitParams(
-            disable=False,
-            req_to_token_pool=bundle.req_to_token_pool,
-            token_to_kv_pool_allocator=allocator,
-            page_size=1,
-            sliding_window_size=window,
-            tree_slots=storage_tree_slots(
-                allocator.storage,
-                window=window,
-                components=(ComponentType.FULL, ComponentType.SWA),
-            ),
-        )
-    )
-    return allocator, cache, allocator.release_queue
-
-
 class TestWindowRetirementWaitsLikeAnyFree(CustomTestCase):
     """A chunk's checkpoint retires window rows up to the end of the chunk
     still running, whose earlier queries read them: they are held like any
@@ -563,7 +584,7 @@ class TestWindowRetirementWaitsLikeAnyFree(CustomTestCase):
 
     def test_window_rows_retired_under_a_running_chunk_are_held(self):
         setup_allocator_context()
-        allocator, cache, queue = _own_table_cache(window=8)
+        allocator, cache, queue = _swa_cache(window=8, occupancy=0)
         window = allocator.swa_attn_allocator
         # A 32-token chunk: its checkpoint frontier is its last token, while
         # its earlier queries read the rows below.
@@ -587,7 +608,7 @@ class TestHeldWindowRowsAreReleased(CustomTestCase):
 
     def test_a_token_id_free_after_window_retirement_frees_each_row_once(self):
         setup_allocator_context()
-        allocator, cache, queue = _own_table_cache(window=8)
+        allocator, cache, queue = _swa_cache(window=8, occupancy=0)
         window = allocator.swa_attn_allocator
         tokens = list(range(900, 932))
         req = _request(cache, tokens, committed=32, allocated=32)
@@ -615,7 +636,7 @@ class TestRebindAfterAHeldFree(CustomTestCase):
 
     def _run(self, launched):
         setup_allocator_context()
-        allocator, cache, queue = _own_table_cache(window=8)
+        allocator, cache, queue = _swa_cache(window=8, occupancy=0)
         window = allocator.swa_attn_allocator
         long_tokens = list(range(7000, 7032))
         prefix = _request(cache, long_tokens[:16], committed=16, allocated=16)
@@ -648,7 +669,7 @@ class TestRebindAfterAHeldFree(CustomTestCase):
 
     def test_binding_a_held_id_without_draining_fails_checks(self):
         setup_allocator_context()
-        allocator, cache, queue = _own_table_cache(window=8)
+        allocator, cache, queue = _swa_cache(window=8, occupancy=0)
         window = allocator.swa_attn_allocator
         owner = allocator.alloc(8)
         pages = owner.to(torch.int64)
@@ -766,7 +787,7 @@ class TestEarlyWindowReleaseWaitsForTheForward(CustomTestCase):
 
     def test_an_early_window_release_is_evictable_only_after_retire(self):
         setup_allocator_context()
-        allocator, cache, queue = _own_table_cache(window=8)
+        allocator, cache, queue = _swa_cache(window=8, occupancy=0)
         window = allocator.swa_attn_allocator
         tokens = list(range(4000, 4016))
         ids = allocator.alloc(16)
@@ -800,7 +821,7 @@ class TestWindowReleaseUnderStrictChecks(CustomTestCase):
 
     def test_release_after_window_retirement_passes_strict_checks(self):
         setup_allocator_context()
-        allocator, cache, queue = _own_table_cache(window=8)
+        allocator, cache, queue = _swa_cache(window=8, occupancy=0)
         tokens = list(range(600, 632))
         req = _request(cache, tokens, committed=32, allocated=32)
         req.finished_reason = FINISH_LENGTH(length=1)
