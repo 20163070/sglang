@@ -8,6 +8,7 @@ import time
 from array import array
 from contextlib import nullcontext
 from dataclasses import replace
+from functools import partial
 from http import HTTPStatus
 from queue import Queue
 from typing import (
@@ -73,6 +74,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation,
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.release_queue import release_queue_of
 from sglang.srt.mem_cache.kv.plan import TREE_BLOCK, TREE_STATE, TREE_TOKEN, TREE_WINDOW
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -296,6 +298,9 @@ class UnifiedRadixCache(BasePrefixCache):
             params=tree_params,
             components=self.components,
         )
+        # Immediate unlocks of a request still in an unretired forward.
+        self._unretired_unlocks = 0
+        self._last_unretired_unlock_warning = float("-inf")
         # Components execute boundary actions through the tree core.
         for component in self.components.values():
             component.tree_core = self.tree_core
@@ -900,6 +905,26 @@ class UnifiedRadixCache(BasePrefixCache):
         *,
         allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
     ) -> EvictResult:
+        # A node a forward in flight reads is locked by a request in it, or that
+        # request's unlock waits for the forward (`unlock`): no forward in flight
+        # touches an evicted page, so its free runs at once.
+        queue = release_queue_of(self.token_to_kv_pool_allocator)
+        with queue.quiet_frees() if queue is not None else nullcontext():
+            return self._evict_now(
+                params,
+                available_size_targets,
+                allocation_reclaim_satisfied=allocation_reclaim_satisfied,
+            )
+
+    def _evict_now(
+        self,
+        params: EvictParams,
+        available_size_targets: Optional[
+            dict[ComponentType, tuple[ComponentType, int]]
+        ] = None,
+        *,
+        allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
+    ) -> EvictResult:
         if self.disable:
             return EvictResult()
         start_time = time.perf_counter()
@@ -1374,15 +1399,63 @@ class UnifiedRadixCache(BasePrefixCache):
     def unlock(self, lock: Optional[TreeLock]) -> None:
         if lock is None:
             return
+        self.release_lock_part(partial(self._unlock_now, lock))
+
+    def release_lock_part(self, release: Callable[[], None]) -> None:
+        """Every decrement of a request's tree lock (the final unlock, an early
+        window release) is part of releasing its KV: it waits in the pool's
+        release queue behind the request's page frees until the forwards in
+        flight retire, and runs at once otherwise. So every node part without a
+        lock is retired: no running forward reads it, and eviction frees it at
+        once. Callers update the lock's bookkeeping when they call, so later
+        releases see it; the queue runs the decrements in call order."""
+        queue = release_queue_of(self.token_to_kv_pool_allocator)
+        if queue is not None and queue.defer(release):
+            return
+        release()
+
+    def unlock_pin(self, lock: Optional[TreeLock], req: Req) -> None:
+        """Release at once a temporary pin taken for ``req``: a request in no
+        launched forward has no tokens to retire."""
+        if lock is None:
+            return
+        queue = release_queue_of(self.token_to_kv_pool_allocator)
+        if queue is not None and queue.in_flight() and req.inflight_steps > 0:
+            # The pin bypasses the queue, yet a forward that includes its
+            # request may still read the node.
+            self._warn_unretired_unlock(req, queue)
+        self._unlock_now(lock)
+
+    def _warn_unretired_unlock(self, req: Req, queue) -> None:
+        self._unretired_unlocks += 1
+        now = time.monotonic()
+        if now - self._last_unretired_unlock_warning < 10.0:
+            return
+        self._last_unretired_unlock_warning = now
+        logger.warning(
+            "Request %s unlocked a tree node at once while it is in a forward "
+            "that has not retired (forwards up to %d of %d retired; %d such "
+            "unlocks so far): the node can be evicted while that forward reads it.",
+            req.rid,
+            queue.quiet_through,
+            queue.newest_launched,
+            self._unretired_unlocks,
+        )
+
+    def _unlock_now(self, lock: TreeLock) -> None:
         self.dec_lock_ref(lock.node, lock.receipt, skip_swa=lock.swa_released)
 
     def release_swa(self, lock: Optional[TreeLock]) -> None:
         """Release the SWA part of ``lock`` early, once."""
         if self.disable or lock is None or lock.swa_released:
             return
-        result = self.tree_core.dec_swa_lock_only(lock.node, lock.receipt)
-        self._apply_eviction_result(result)
         lock.swa_released = True
+        node, receipt = lock.node, replace(lock.receipt)
+
+        def release():
+            self._apply_eviction_result(self.tree_core.dec_swa_lock_only(node, receipt))
+
+        self.release_lock_part(release)
 
     def release_swa_prefix_lock(self, req: Req) -> None:
         """The request's window has moved past its prefix: leave the prefix's
@@ -1405,10 +1478,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 if ct == self.slot_id(TREE_WINDOW):
                     self.release_swa(lock)
                 else:
-                    result = self.tree_core.dec_window_lock_only(
-                        lock.node, ct, lock.receipt
+                    self.release_lock_part(
+                        partial(
+                            self._release_window_lock,
+                            lock.node,
+                            ct,
+                            replace(lock.receipt),
+                        )
                     )
-                    self._apply_eviction_result(result)
                     # The receipt already tracks individually relinquished locks
                     # (including state COW sources). Final unlock skips exactly these.
                     lock.receipt.skipped_lock_components += (ct,)
@@ -1419,6 +1496,11 @@ class UnifiedRadixCache(BasePrefixCache):
             is not None
         ):
             self.release_swa(lock)
+
+    def _release_window_lock(self, node, component_type, receipt) -> None:
+        self._apply_eviction_result(
+            self.tree_core.dec_window_lock_only(node, component_type, receipt)
+        )
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
         if self.disable:

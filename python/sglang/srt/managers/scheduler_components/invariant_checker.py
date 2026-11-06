@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.kv.alloc.release_queue import release_queue_of
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_SANITY_CHECK_CACHE,
@@ -299,6 +300,14 @@ class SchedulerInvariantChecker:
 
             if req.beam_group is not None:
                 full_uncached += req.beam_group.extra_uncached_tokens()
+
+        # Pages of ended requests held until the forward in flight is processed.
+        allocator = self.tree_cache.token_to_kv_pool_allocator
+        queue = release_queue_of(allocator)
+        if queue is not None:
+            full_uncached += queue.held_tokens(allocator.full_attn_allocator)
+            if has_window and allocator.swa_attn_allocator is not None:
+                swa_uncached += queue.held_tokens(allocator.swa_attn_allocator)
 
         return full_uncached, swa_uncached
 

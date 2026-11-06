@@ -573,6 +573,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         if lock is not None:
             self.dec_lock_ref(lock.node, lock.receipt)
 
+    def unlock_pin(self, lock: Optional[TreeLock], req: Req) -> None:
+        """Release at once a temporary pin taken for ``req``, a request in no
+        launched forward (admission looking at a candidate)."""
+        self.unlock(lock)
+
     def path_device_indices(self, node: Any) -> torch.Tensor:
         """Device KV indices on the path from the root to ``node``; valid until
         the next allocation or eviction unless the path is locked."""

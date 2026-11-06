@@ -53,6 +53,7 @@ from sglang.srt.mem_cache.kv.alloc.pricing import (
     no_relief_plan,
     snapshot_chain,
 )
+from sglang.srt.mem_cache.kv.alloc.release_queue import ReleaseQueue
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
@@ -273,6 +274,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 self.mamba_allocator,
             )
             if b is not None
+        )
+        # A lazy chain reuses a freed page from the schedule stream (zeroing,
+        # compaction), so a free waits for the forwards in flight; an eager free
+        # orders itself after the forward stream instead.
+        self.release_queue: Optional[ReleaseQueue] = (
+            ReleaseQueue(self.members, forward_stream) if lazy_compaction else None
         )
         by_name = {band.sub_pool_name: band for band in self.members}
         self.bands = tuple(by_name[band.name] for band in arena.bands)
@@ -1232,13 +1239,23 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             # window needs the tombstone filter; the owner's ids are all bound.
             v = free_index.detach().to(torch.int64)
             for window in self._windows:
-                window_v2p_pages = window.ids.virtual_to_physical[v // self.page_size]
-                # `> 0` strict: -1 = tombstoned, 0 = padding-sink page; both skipped.
-                live_tokens = v[window_v2p_pages > 0]
+                live_tokens = v[self._window_bound(window, v // self.page_size)]
                 if live_tokens.numel() > 0:
                     window.free(live_tokens)
             self.full_attn_allocator.free(v)
             self._clear_inverse_history()
+
+    def _window_bound(self, window: Band, pages: torch.Tensor) -> torch.Tensor:
+        """Which of ``pages`` still hold a row of ``window``. `> 0` strict:
+        -1 = released, 0 = the padding sink. A page whose free the release
+        queue holds keeps its binding until the forwards in flight are
+        processed, yet is released already: it never goes back twice."""
+        bound = window.ids.virtual_to_physical[pages] > 0
+        queue = self.release_queue
+        held = None if queue is None else queue.held_pages(window)
+        if held is not None:
+            bound &= ~torch.isin(pages, held)
+        return bound
 
     def free_swa(self, free_index: torch.Tensor) -> None:
         self.free_window(self.roles.window, free_index)
@@ -1248,7 +1265,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             return
         window = self.window_allocators[name]
         v = free_index.detach().to(torch.int64)
-        live = v[window.ids.virtual_to_physical[v // self.page_size] > 0]
+        live = v[self._window_bound(window, v // self.page_size)]
         if live.numel():
             window.free(live, _pages=live if self.page_size == 1 else None)
             window.clear_inverse_history()
@@ -1273,7 +1290,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         if resolve_level() >= InvariantCheckLevel.WARN:
             expect(
                 UNIFIED_SWA_SEGMENT_BOUND,
-                window.ids.virtual_to_physical[v_pages] > 0,
+                self._window_bound(window, v_pages),
                 msg="caller wants free_full_segment",
             )
         window.free(reps, _pages=v_pages)
@@ -1312,10 +1329,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         # Signal-only invariant: avoid launching its lookup and comparison
         # when detection is disabled. This invariant has no recovery action.
         if resolve_level() >= InvariantCheckLevel.WARN:
+            pages = reps // self.page_size
             for window in self._windows:
                 expect(
                     UNIFIED_SWA_SEGMENT_RELEASED,
-                    window.ids.virtual_to_physical[reps // self.page_size] <= 0,
+                    ~self._window_bound(window, pages),
                     msg="caller wants free_segment",
                 )
         if self.free_page_reps_group is None:
@@ -1331,7 +1349,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         assert full_indices.numel() == swa_indices.numel()
         full_pages = full_indices.to(torch.int64) // self.page_size
         swa_pages = swa_indices.to(torch.int64) // self.page_size
-        self.swa_attn_allocator.ids.bind(full_pages, swa_pages)
+        window = self.swa_attn_allocator
+        if self.release_queue is not None:
+            # A held free of these ids would release the rows bound here.
+            self.release_queue.drain_if_held(window, full_pages)
+        window.ids.bind(full_pages, swa_pages)
 
     def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
         # Paired with set_full_to_swa_mapping: a shared id space has no mapping tensor.
@@ -1387,6 +1409,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self._clear_inverse_history()
 
     def clear(self) -> None:
+        if self.release_queue is not None:
+            self.release_queue.clear()
         for member in self.members:
             member.clear()
         if self.state is not None:

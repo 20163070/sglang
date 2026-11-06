@@ -31,6 +31,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.kv.alloc.interim import ChainAdmissionRules
+from sglang.srt.mem_cache.kv.alloc.release_queue import drain_held
 
 
 def estimate_swa_kv_tokens(
@@ -534,6 +535,15 @@ class ChainPrefillBudget(SWAPrefillBudget):
         )
 
     def check_prefill(self, **kwargs) -> tuple[bool, int | None]:
+        # Frees the pool holds for the forwards in flight count as occupied;
+        # when the request does not fit, the pool waits for those forwards and
+        # gives them back before checking again (`drain_held`).
+        result = self._check_prefill(**kwargs)
+        if not result[0] and drain_held(self.allocator):
+            result = self._check_prefill(**kwargs)
+        return result
+
+    def _check_prefill(self, **kwargs) -> tuple[bool, int | None]:
         if self.rules.window == "joint":
             return self._joint_check_prefill(**kwargs)
         state_slots = kwargs.pop("state_slots", 0)

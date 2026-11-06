@@ -15,6 +15,7 @@ import msgspec
 import torch
 
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance, advance_tracking
+from sglang.srt.mem_cache.kv.alloc.release_queue import drain_held
 from sglang.srt.mem_cache.kv.decl import StateLifetime, WindowLifetime
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLAHostLayout
@@ -197,13 +198,27 @@ class KVStorage:
             reset_request_parts=False,
         )
 
+    def _take(self, take: Callable[[], Optional[torch.Tensor]]):
+        """``take()``; when it does not fit while the pool holds frees for the
+        forwards in flight, once more after the pool gives them back
+        (`drain_held`). Every take of this storage goes through here, whole:
+        never a drain inside a take of several sub-pools."""
+        out = take()
+        if out is None and drain_held(self._allocator):
+            out = take()
+        return out
+
     def take_tokens(
         self, num_tokens: int, *, make_room: Callable[[int], Any]
     ) -> Optional[torch.Tensor]:
         """Owner token ids, one per token (page size 1); None when they do not
         fit."""
-        make_room(num_tokens)
-        return self._allocator.alloc(num_tokens)
+
+        def take():
+            make_room(num_tokens)
+            return self._allocator.alloc(num_tokens)
+
+        return self._take(take)
 
     def take_extend(
         self,
@@ -232,21 +247,30 @@ class KVStorage:
             + len(seq_lens_cpu) * self._allocator.page_size,
             shard_size=1,
         )
-        make_room(demand)
-        if window_tail is not None:
-            return self._allocator.alloc_extend_swa_tail(
-                prefix_lens=prefix_lens,
-                prefix_lens_cpu=prefix_lens_cpu,
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu,
-                last_loc=last_loc,
-                extend_num_tokens=num_tokens,
-                swa_tail_len=window_tail,
-                window_tail_lens=stated_window_tails,
+
+        def take():
+            make_room(demand)
+            if window_tail is not None:
+                return self._allocator.alloc_extend_swa_tail(
+                    prefix_lens=prefix_lens,
+                    prefix_lens_cpu=prefix_lens_cpu,
+                    seq_lens=seq_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    last_loc=last_loc,
+                    extend_num_tokens=num_tokens,
+                    swa_tail_len=window_tail,
+                    window_tail_lens=stated_window_tails,
+                )
+            return self._allocator.alloc_extend(
+                prefix_lens,
+                prefix_lens_cpu,
+                seq_lens,
+                seq_lens_cpu,
+                last_loc,
+                num_tokens,
             )
-        return self._allocator.alloc_extend(
-            prefix_lens, prefix_lens_cpu, seq_lens, seq_lens_cpu, last_loc, num_tokens
-        )
+
+        return self._take(take)
 
     def take_decode(
         self,
@@ -260,8 +284,12 @@ class KVStorage:
         """One owner token id per ``rows`` entry, at ``seq_len - 1``, taking a
         page only when that request's last page is full; None when they do not
         fit."""
-        make_room(len(seq_lens) * self._allocator.page_size)
-        return self._allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+
+        def take():
+            make_room(len(seq_lens) * self._allocator.page_size)
+            return self._allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+
+        return self._take(take)
 
     def free_tokens(self, ids: torch.Tensor) -> None:
         """Give back owner token ids no request holds any more."""
@@ -435,9 +463,11 @@ class KVStorage:
         self, sub_pool: str, owner_ids: torch.Tensor, window_ids: torch.Tensor
     ) -> None:
         """Let these owner token ids name these window rows."""
-        self._allocator.window_allocators[sub_pool].ids.bind(
-            owner_ids.to(torch.int64) // self._allocator.page_size,
-            window_ids.to(torch.int64) // self._allocator.page_size,
+        window = self._allocator.window_allocators[sub_pool]
+        owner_pages = owner_ids.to(torch.int64) // self._allocator.page_size
+        _drain_if_held(window, owner_pages)
+        window.ids.bind(
+            owner_pages, window_ids.to(torch.int64) // self._allocator.page_size
         )
 
     def rehome_window(
@@ -451,6 +481,7 @@ class KVStorage:
         kept_pages, incoming_pages = _page_pairs(
             kept_ids, incoming_ids, self._allocator.page_size
         )
+        _drain_if_held(window, torch.cat([kept_pages, incoming_pages]))
         physical = window.ids.virtual_to_physical[incoming_pages]
         # `> 0` strict: -1 = dropped, 0 = the padding sink. The incoming ids
         # were just allocated by the request in flight, so every page is live;
@@ -497,7 +528,7 @@ class KVStorage:
 
     def take_state_slots(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
         """``count`` free state slots of ``sub_pool``; None when none are free."""
-        return self._allocator.state_slots.alloc(count)
+        return self._take(lambda: self._allocator.state_slots.alloc(count))
 
     def free_state_slots(self, sub_pool: str, slots: torch.Tensor) -> None:
         self._allocator.state_slots.free(slots)
@@ -764,6 +795,13 @@ class KVStorage:
             slots = self._allocator.state_slots
             return slots.alloc, slots.free
         return None
+
+
+def _drain_if_held(band, pages: torch.Tensor) -> None:
+    """Before ``pages`` of ``band`` are bound to other rows: a free of them the
+    release queue holds runs first, so it cannot release the new rows."""
+    if band.release_queue is not None:
+        band.release_queue.drain_if_held(band, pages)
 
 
 def _page_pairs(

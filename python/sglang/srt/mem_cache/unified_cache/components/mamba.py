@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
+from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -692,14 +693,17 @@ class MambaComponent(TreeComponent):
                     and ct not in lock.receipt.skipped_lock_components
                 ):
                     # Prefill has consumed the COW source; retain only its KV locks.
-                    self.cache.dec_lock_ref(
-                        lock.node,
-                        replace(
-                            lock.receipt,
-                            skipped_lock_components=tuple(
-                                c for c in self.cache.tree_components if c != ct
+                    self.cache.release_lock_part(
+                        partial(
+                            self.cache.dec_lock_ref,
+                            lock.node,
+                            replace(
+                                lock.receipt,
+                                skipped_lock_components=tuple(
+                                    c for c in self.cache.tree_components if c != ct
+                                ),
                             ),
-                        ),
+                        )
                     )
                     lock.receipt.skipped_lock_components += (ct,)
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))

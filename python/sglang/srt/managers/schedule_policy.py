@@ -1223,7 +1223,10 @@ class PrefillAdder:
         return req if truncated else None
 
     @contextmanager
-    def _lock_node(self, last_node: TreeNode, *, lock_host: bool = False):
+    def _lock_node(self, last_node: TreeNode, req: Req, *, lock_host: bool = False):
+        """Pin ``last_node`` for the candidate ``req`` while admission looks at
+        it. The candidate is in no launched forward, so the pin releases at once
+        on exit, even while forwards are in flight."""
         host_lock_params = (
             self.tree_cache.inc_host_lock_ref(last_node).to_dec_params()
             if lock_host
@@ -1234,7 +1237,7 @@ class PrefillAdder:
             try:
                 yield None
             finally:
-                self.tree_cache.unlock(lock)
+                self.tree_cache.unlock_pin(lock, req)
         finally:
             if host_lock_params is not None:
                 self.tree_cache.dec_host_lock_ref(last_node, host_lock_params)
@@ -1442,7 +1445,7 @@ class PrefillAdder:
 
         # The temporary pin excludes this prefix from the evictable budget.
         # Selection itself neither allocates slots nor materializes host hits.
-        with self._lock_node(req.last_node):
+        with self._lock_node(req.last_node, req):
             admission = self._select_prefill_admission(
                 req,
                 total_tokens=total_tokens,
@@ -1487,7 +1490,7 @@ class PrefillAdder:
                 # Reclaim can write back device victims and evict host leaves.
                 # Pin the selected host/aux match until load-back owns its locks.
                 with (
-                    self._lock_node(req.best_match_node, lock_host=True)
+                    self._lock_node(req.best_match_node, req, lock_host=True)
                     if isinstance(self.tree_cache, UnifiedRadixCache)
                     else nullcontext()
                 ):

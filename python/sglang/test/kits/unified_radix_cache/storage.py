@@ -209,7 +209,7 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
                 cache.buffer_pipeline.prepare_staged_prefetch(req),
                 "production admission FULL rematch unexpectedly deferred",
             )
-            with adder._lock_node(req.last_node):
+            with adder._lock_node(req.last_node, req):
                 loaded = cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=None,

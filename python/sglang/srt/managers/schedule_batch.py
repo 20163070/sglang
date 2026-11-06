@@ -133,6 +133,7 @@ from sglang.srt.mem_cache.common import (
     match_kv_cache,
 )
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance
+from sglang.srt.mem_cache.kv.alloc.release_queue import drain_held
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -2864,19 +2865,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         the capacity gate (eviction + any per-step reservations of its own) —
         the retract loop converges on this same check, so allocator-side
         shortfalls retract gracefully instead of tripping fail-loud alloc
-        errors."""
+        errors. Frees the pool holds for the forwards in flight count as
+        occupied; when they are what is short, the pool waits for those
+        forwards and gives them back first (`drain_held`)."""
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
         requests = (
             self.reqs
             if selected_indices is None
             else [self.reqs[i] for i in selected_indices]
         )
-        return self.token_to_kv_pool_allocator.check_decode_capacity(
-            num_tokens=num_tokens,
-            tree_cache=self.tree_cache,
-            requests=requests,
-            spec_algorithm=self.spec_algorithm,
-        )
+        allocator = self.token_to_kv_pool_allocator
+
+        def fits() -> bool:
+            return allocator.check_decode_capacity(
+                num_tokens=num_tokens,
+                tree_cache=self.tree_cache,
+                requests=requests,
+                spec_algorithm=self.spec_algorithm,
+            )
+
+        return fits() or (drain_held(allocator) and fits())
 
     def retract_decode(
         self, request_retirer: RequestRetirer

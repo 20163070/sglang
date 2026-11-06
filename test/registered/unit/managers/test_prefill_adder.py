@@ -86,6 +86,7 @@ class TestPrefillAdder(CustomTestCase):
         tree_cache.unlock.side_effect = lambda lock: (
             lock is not None and tree_cache.dec_lock_ref(lock.node, lock.receipt)
         )
+        tree_cache.unlock_pin.side_effect = lambda lock, req: tree_cache.unlock(lock)
         tree_cache.buffer_pipeline = None
         return tree_cache
 

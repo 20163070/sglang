@@ -31,6 +31,7 @@ import inspect
 import logging
 import os
 from typing import (
+    TYPE_CHECKING,
     Callable,
     Dict,
     Generic,
@@ -54,6 +55,9 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv.alloc.id_space import UnitIds
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.runtime_context import get_parallel
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.kv.alloc.release_queue import ReleaseQueue
 
 logger = logging.getLogger(__name__)
 
@@ -307,6 +311,9 @@ class Band:
         self.need_sort = need_sort
         # None: free right away. A list: hold frees until free_group_end().
         self.free_group: Optional[List[torch.Tensor]] = None
+        # The chain's queue of frees held until the forwards in flight are
+        # processed (lazy chains only).
+        self.release_queue: Optional[ReleaseQueue] = None
         self.arena = arena
         self.sub_pool_name = sub_pool_name
         self.max_slots = max_slots
@@ -1148,11 +1155,16 @@ class Band:
         the data-dependent dedup is skipped. `free_index` is token-granular and
         need not be page-aligned. EAGER drops one `wait_stream(forward_stream)`
         barrier so the v2p/p2v writes and the compaction move serialize with the
-        in-flight forward; LAZY waits for the latest forward before recycling
-        physical storage and defers compaction to `_flush`.
+        in-flight forward; LAZY defers compaction to `_flush`. While a forward is
+        in flight the chain's release queue holds the free until it is
+        processed (`ReleaseQueue`).
         """
         with record_function("Band.free"):
             if free_index is None or free_index.numel() == 0:
+                return
+            if self.release_queue is not None and self.release_queue.hold_free(
+                self, free_index, _pages
+            ):
                 return
             if self.free_group is not None:
                 self.free_group.append(self._copy_for_free_group(free_index))
@@ -1233,15 +1245,9 @@ class Band:
                 free_v_pages = free_v_pages_raw
             else:
                 free_v_pages = torch.unique(free_v_pages_raw // self.page_size)
-            # A prepared attention page table can still read the freed storage
-            # after shared metadata reads finish. Order reuse after the whole
-            # forward, before a later allocation can overwrite or zero it.
-            if (
-                self._latest_forward_done_event is not None
-                and torch.device(self.device).type == "cuda"
-            ):
-                torch.cuda.current_stream().wait_event(self._latest_forward_done_event)
-            # One kernel for the v2p read and both tombstones. Never the scalar
+            # A free made while a forward was in flight reaches here only once it
+            # was processed (`ReleaseQueue`), so a page freed here is quiet. One
+            # kernel for the v2p read and both tombstones. Never the scalar
             # `t[idx] = -1` form: it materialises -1 on the CPU and blocks
             # the scheduler on a pageable H2D copy (~16 ms per 8192-token free).
             freed_p_pages = free_unbind_inplace(
@@ -2303,6 +2309,10 @@ class FloatBand(Band):
         """
         with record_function("FloatBand.free"):
             if free_index is None or free_index.numel() == 0:
+                return
+            if self.release_queue is not None and self.release_queue.hold_free(
+                self, free_index, _pages
+            ):
                 return
             if self.free_group is not None:
                 self.free_group.append(self._copy_for_free_group(free_index))

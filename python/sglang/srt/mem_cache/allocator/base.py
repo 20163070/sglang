@@ -22,6 +22,7 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
+    from sglang.srt.mem_cache.kv.alloc.release_queue import ReleaseQueue
     from sglang.srt.mem_cache.kv.state_storage import StateStorage
     from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -50,6 +51,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     state: Optional[StateStorage] = None
     # A unified pool's sub-pools as host and peer transfers read them.
     storage: Optional[KVStorage] = None
+    # Releases held until the forwards that include their requests are
+    # processed; only a lazily compacting unified pool reuses a page before that.
+    release_queue: Optional[ReleaseQueue] = None
 
     @property
     def state_slots(self):

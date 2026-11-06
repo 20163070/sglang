@@ -334,6 +334,7 @@ from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.kv.alloc.release_queue import release_queue_of
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -516,6 +517,8 @@ class Scheduler(
         self.processed_tokens_counter: int = 0
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         self.init_soft_watchdog()
+        # The pool's release generation the last processed step saw.
+        self.release_generation_seen: int = 0
 
         # Parse args
         self.server_args = server_args
@@ -4747,6 +4750,13 @@ class Scheduler(
         # Whether to run the profiler; a capture it starts here covers this step.
         self.profiler_manager._profile_batch_predicate(batch)
         batch.add_inflight_step()
+        # Frees from now on wait for this step in a pool that reuses freed pages
+        # outside forward order (`ReleaseQueue`).
+        release_queue = release_queue_of(
+            getattr(self, "token_to_kv_pool_allocator", None)
+        )
+        if release_queue is not None:
+            release_queue.forward_launched()
         self._join_prefill_launched(batch)
         self.invariant_checker.maybe_check_request_lists(batch)
 
@@ -4754,6 +4764,18 @@ class Scheduler(
         """The bookkeeping of every step once its result is processed."""
         self.invariant_checker.maybe_check_batch_consistency(batch)
         batch.drop_inflight_step()
+        # The forward is done (its result processing synchronized it): the pool
+        # gives back what was freed while it ran. Capacity that came back since
+        # the last step, here or by a drain, reopens admission a rejection
+        # closed, as requests that finish do.
+        release_queue = release_queue_of(
+            getattr(self, "token_to_kv_pool_allocator", None)
+        )
+        if release_queue is not None:
+            release_queue.forward_retired()
+            if release_queue.release_generation != self.release_generation_seen:
+                self.release_generation_seen = release_queue.release_generation
+                self.running_batch.batch_is_full = False
         # Requests finish only in a step's processing.
         self.running_reqs.leave_finished()
         self.prefill_launched_reqs.leave_finished()

@@ -29,7 +29,9 @@ import torch
 from torch.profiler import record_function
 
 from sglang.kernels.ops.memory.virtual_slot import bind_inplace, translate_token_ids
+from sglang.srt.environ import InvariantCheckLevel
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.invariants import resolve_level
 
 
 class IdSpaceKind(str, enum.Enum):
@@ -126,8 +128,16 @@ class UnitIds:
         self.physical_to_virtual[0] = 0
         self.physical_to_virtual[-1] = -1
 
+    # The virtual ids whose free a release queue holds (`ReleaseQueue`).
+    held_pages: Optional[Callable[[], Optional[torch.Tensor]]] = None
+
     def bind(self, virtual_ids: torch.Tensor, physical_ids: torch.Tensor) -> None:
         """Pair unit-granular virtual ids with physical ids."""
+        if self.held_pages is not None and resolve_level() >= InvariantCheckLevel.WARN:
+            held = self.held_pages()
+            assert held is None or not bool(
+                torch.isin(virtual_ids.to(torch.int64), held).any()
+            ), "binding a virtual id whose free is held: drain first (drain_if_held)"
         with record_function("UnitIds.bind"):
             bind_inplace(
                 virtual_ids,
