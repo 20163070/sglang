@@ -524,6 +524,10 @@ class _TokenEndsPolicy(_WindowPolicy):
         realization = ends_realization(
             _snapshot(c), ends, num_full_pages, num_swa_pages
         )
+        if (realization.flush_ends or not realization.fits) and c.settle_empty_floats():
+            realization = ends_realization(
+                _snapshot(c), ends, num_full_pages, num_swa_pages
+            )
         if not realization.flush_ends:
             return realization.fits
         c.full_attn_allocator.flush_for_allocation()
@@ -755,6 +759,8 @@ class _FloatChainPolicy(_WindowPolicy):
         if full_tokens < 0 or swa_tokens < 0:
             return False
         if c.can_reserve(full_tokens, swa_tokens):
+            return True
+        if c.settle_empty_floats() and c.can_reserve(full_tokens, swa_tokens):
             return True
         if full_tokens != swa_tokens:
             for allocator in c._flush_targets():
